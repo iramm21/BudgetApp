@@ -1,0 +1,86 @@
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id              String          @id @default(cuid())
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  incomeSettings  IncomeSettings?
+  budgetCategories BudgetCategory[]
+  transactions    Transaction[]
+  savingsGoals    SavingsGoal[]
+}
+
+model IncomeSettings {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  baseNetPayCents    Int
+  payFrequencyDays   Int      @default(14)
+  currency           String   @default("AUD")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model BudgetCategory {
+  id                  String   @id @default(cuid())
+  userId              String
+  name                String
+  group               String
+  plannedAmountCents  Int      @default(0)
+  sortOrder           Int      @default(0)
+  isArchived          Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@index([userId, group])
+}
+
+model Transaction {
+  id             String   @id @default(cuid())
+  userId         String
+  categoryId     String?
+  description    String
+  amountCents    Int
+  type           String
+  date           DateTime
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category BudgetCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([userId, date])
+  @@index([categoryId])
+}
+
+model SavingsGoal {
+  id                String   @id @default(cuid())
+  userId            String
+  name              String
+  targetAmountCents Int
+  currentAmountCents Int     @default(0)
+  targetDate        DateTime?
+  notes             String?
+  isCompleted       Boolean  @default(false)
+  sortOrder         Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sortOrder])
+}
