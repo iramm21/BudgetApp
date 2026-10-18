@@ -2,11 +2,32 @@
 "use client";
 
 import Link from "next/link";
-import { useState, useSyncExternalStore, type FormEvent } from "react";
+import {
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type FormEvent,
+} from "react";
 import type { BudgetCategory, BudgetGroup } from "./types";
-import { loadBudgetPlan, saveBudgetPlan } from "./storage";
+import {
+  loadBudgetPlan,
+  saveBudgetPlan as saveBudgetPlanToStorage,
+  DEFAULT_CATEGORIES,
+} from "./storage";
+import {
+  getBudgetPlan,
+  initializeBudgetPlan,
+  saveBudgetPlanToDatabase,
+} from "./actions";
 import { loadIncomeSettings } from "@/features/income/storage";
-import { loadTransactions } from "@/features/transactions/storage";
+import {
+  getTransactions,
+} from "@/features/transactions/actions";
+import {
+  loadTransactions,
+  saveTransactions,
+} from "@/features/transactions/storage";
+import type { Transaction } from "@/features/transactions/types";
 import { calculateCategorySpendingCents } from "@/features/transactions/calculations";
 import {
   calculateAllocationPercentage,
@@ -66,24 +87,108 @@ function getPeriodStartDate(days: number): string {
 
 function BudgetPlannerForm() {
   const [periodDays, setPeriodDays] = useState<7 | 14>(14);
-  const [transactions] = useState(() => loadTransactions());
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
 
-  const [categories, setCategories] = useState<DraftCategory[]>(() =>
-    loadBudgetPlan().categories.map((category) => ({
-      id: category.id,
-      name: category.name,
-      group: category.group,
-      plannedAmount: (category.plannedAmountCents / 100).toFixed(2),
-    })),
-  );
-
+  const [categories, setCategories] = useState<DraftCategory[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [transactionLoadError, setTransactionLoadError] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState(false);
 
   const incomeSettings = loadIncomeSettings();
   const incomeCents = incomeSettings?.baseNetPayCents ?? 0;
 
-  // Convert editable dollar strings into the cents-based budget model.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadBudget() {
+      try {
+        let plan = await getBudgetPlan();
+
+        if (plan === null) {
+          const browserPlan = loadBudgetPlan();
+          plan = await initializeBudgetPlan(browserPlan.categories);
+        }
+
+        if (cancelled) return;
+
+        setCategories(
+          plan.categories.map((category) => ({
+            id: category.id,
+            name: category.name,
+            group: category.group,
+            plannedAmount: (
+              category.plannedAmountCents / 100
+            ).toFixed(2),
+          })),
+        );
+
+        saveBudgetPlanToStorage(plan);
+        setLoadError(false);
+      } catch (error) {
+        console.error(
+          "Failed to load the budget from the database:",
+          error,
+        );
+
+        if (cancelled) return;
+
+        setCategories(
+          loadBudgetPlan().categories.map((category) => ({
+            id: category.id,
+            name: category.name,
+            group: category.group,
+            plannedAmount: (
+              category.plannedAmountCents / 100
+            ).toFixed(2),
+          })),
+        );
+
+        setLoadError(true);
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    async function loadDatabaseTransactions() {
+      try {
+        const databaseTransactions = await getTransactions();
+
+        if (cancelled) return;
+
+        const normalisedTransactions: Transaction[] =
+          databaseTransactions.map((transaction) => ({
+            ...transaction,
+            categoryId: transaction.categoryId ?? "",
+          }));
+
+        setTransactions(normalisedTransactions);
+        saveTransactions(normalisedTransactions);
+        setTransactionLoadError(false);
+      } catch (error) {
+        console.error(
+          "Failed to load transactions from the database:",
+          error,
+        );
+
+        if (cancelled) return;
+
+        // Browser data is a fallback only if the database cannot be read.
+        setTransactions(loadTransactions());
+        setTransactionLoadError(true);
+      }
+    }
+
+    void loadBudget();
+    void loadDatabaseTransactions();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const validCategories: BudgetCategory[] = categories.map((category) => {
     const amount =
       category.plannedAmount.trim() === ""
@@ -117,7 +222,10 @@ function BudgetPlannerForm() {
     incomeSettings?.payFrequency === "weekly" ? 7 : 14;
 
   const periodBudgetScale = periodDays / payPeriodDays;
-  const periodIncomeCents = Math.round(incomeCents * periodBudgetScale);
+
+  const periodIncomeCents = Math.round(
+    incomeCents * periodBudgetScale,
+  );
 
   const periodAllocatedCents = Math.round(
     totalAllocatedCents * periodBudgetScale,
@@ -159,27 +267,59 @@ function BudgetPlannerForm() {
     setSaveError(false);
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!inputsValid) return;
+    if (!inputsValid || isSaving || isLoading) return;
 
-    const success = saveBudgetPlan({
+    setIsSaving(true);
+    setSaved(false);
+    setSaveError(false);
+
+    const plan = {
       categories: validCategories,
-    });
+    };
 
-    setSaved(success);
-    setSaveError(!success);
+    try {
+      await saveBudgetPlanToDatabase(plan.categories);
+      saveBudgetPlanToStorage(plan);
+
+      setSaved(true);
+      setLoadError(false);
+    } catch (error) {
+      console.error(
+        "Failed to save the budget to the database:",
+        error,
+      );
+
+      saveBudgetPlanToStorage(plan);
+      setSaveError(true);
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   const allocationIsOver = allocationPercentage > 100;
 
+  if (isLoading) {
+    return (
+      <div className="mx-auto w-full max-w-5xl space-y-4">
+        <div className="h-9 w-64 animate-pulse rounded bg-[var(--border)]" />
+        <div className="h-4 w-80 max-w-full animate-pulse rounded bg-[var(--border)]" />
+        <div className="h-32 animate-pulse rounded-xl border border-[var(--border)] bg-[var(--surface)]" />
+        <p className="text-sm text-[var(--muted)]">
+          Loading your budget...
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto w-full max-w-5xl space-y-7 sm:space-y-8">
-      {/* Page heading */}
       <header className="space-y-3">
         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
-          Finances <span className="mx-1.5 text-[var(--border-strong)]">/</span>
+          Finances{" "}
+          <span className="mx-1.5 text-[var(--border-strong)]">/</span>
           Budget
         </p>
 
@@ -187,7 +327,6 @@ function BudgetPlannerForm() {
           <h1 className="text-3xl font-bold tracking-tight text-[var(--foreground)] sm:text-4xl">
             Budget planner
           </h1>
-
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)] sm:text-base">
             Give every dollar a job before you spend it. Plan around your
             reliable income, not overtime.
@@ -195,7 +334,6 @@ function BudgetPlannerForm() {
         </div>
       </header>
 
-      {/* Income setup notice */}
       {!incomeSettings && (
         <section
           className="rounded-xl border border-[var(--warning)]/25 bg-[var(--warning-background)] p-4 sm:p-5"
@@ -203,12 +341,7 @@ function BudgetPlannerForm() {
         >
           <div className="flex items-start gap-3">
             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-white/70 text-[var(--warning)]">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-5"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
                 <path
                   d="M12 8v4m0 4h.01M10.3 3.9 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"
                   stroke="currentColor"
@@ -226,12 +359,10 @@ function BudgetPlannerForm() {
               >
                 Set up your base income first
               </h2>
-
               <p className="mt-1 text-sm leading-5 text-[var(--muted)]">
                 You can still plan your categories, but your remaining balance
                 will appear once you save your income settings.
               </p>
-
               <Link
                 href="/income"
                 className="mt-3 inline-flex items-center gap-1.5 text-sm font-semibold text-[var(--primary)] hover:underline"
@@ -244,7 +375,31 @@ function BudgetPlannerForm() {
         </section>
       )}
 
-      {/* Period selector */}
+      {loadError && (
+        <section
+          role="alert"
+          className="rounded-xl border border-red-200 bg-[var(--danger-background)] p-4"
+        >
+          <p className="text-sm font-medium text-[var(--danger)]">
+            Could not load your budget from the database. Browser data is
+            displayed as a fallback. Saving to the database may also fail.
+          </p>
+        </section>
+      )}
+
+      {transactionLoadError && (
+        <section
+          role="alert"
+          className="rounded-xl border border-red-200 bg-[var(--danger-background)] p-4"
+        >
+          <p className="text-sm font-medium text-[var(--danger)]">
+            Could not load transactions from the database. Spending figures
+            may be based on browser data and may not reflect your latest
+            transactions.
+          </p>
+        </section>
+      )}
+
       <section className="flex flex-col gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--shadow-card)] sm:flex-row sm:items-center sm:justify-between sm:p-5">
         <div>
           <h2 className="text-sm font-semibold text-[var(--foreground)]">
@@ -259,7 +414,6 @@ function BudgetPlannerForm() {
           <label htmlFor="spending-period" className="sr-only">
             Spending period
           </label>
-
           <select
             id="spending-period"
             value={periodDays}
@@ -274,7 +428,6 @@ function BudgetPlannerForm() {
         </div>
       </section>
 
-      {/* Summary cards */}
       <section
         className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3"
         aria-label="Budget summary"
@@ -282,12 +435,7 @@ function BudgetPlannerForm() {
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--shadow-card)] sm:p-5">
           <div className="flex items-center gap-2">
             <span className="flex size-8 items-center justify-center rounded-lg bg-blue-50 text-blue-700">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-4"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
                 <path
                   d="M4 7.5h16M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm9 9h3"
                   stroke="currentColor"
@@ -297,16 +445,13 @@ function BudgetPlannerForm() {
                 />
               </svg>
             </span>
-
             <p className="text-sm font-medium text-[var(--muted)]">
               Budgeted income
             </p>
           </div>
-
           <p className="mt-4 text-2xl font-bold tracking-tight tabular-nums text-[var(--foreground)] sm:text-3xl">
             {incomeSettings ? currency(periodIncomeCents) : "—"}
           </p>
-
           <p className="mt-1 text-xs text-[var(--muted-light)]">
             Reliable income for this period
           </p>
@@ -315,12 +460,7 @@ function BudgetPlannerForm() {
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--shadow-card)] sm:p-5">
           <div className="flex items-center gap-2">
             <span className="flex size-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-700">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-4"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
                 <path
                   d="M5 5h14v14H5zM8 9h8M8 12h8M8 15h5"
                   stroke="currentColor"
@@ -330,16 +470,13 @@ function BudgetPlannerForm() {
                 />
               </svg>
             </span>
-
             <p className="text-sm font-medium text-[var(--muted)]">
               Planned expenses
             </p>
           </div>
-
           <p className="mt-4 text-2xl font-bold tracking-tight tabular-nums text-[var(--foreground)] sm:text-3xl">
             {currency(periodAllocatedCents)}
           </p>
-
           <p className="mt-1 text-xs text-[var(--muted-light)]">
             Allocated across your categories
           </p>
@@ -360,12 +497,7 @@ function BudgetPlannerForm() {
                   : "bg-[var(--success-background)] text-[var(--success)]"
               }`}
             >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-4"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
                 <path
                   d="m5 12 4 4L19 6"
                   stroke="currentColor"
@@ -375,12 +507,10 @@ function BudgetPlannerForm() {
                 />
               </svg>
             </span>
-
             <p className="text-sm font-medium text-[var(--muted)]">
               {remainingCents < 0 ? "Over budget" : "Unallocated income"}
             </p>
           </div>
-
           <p
             className={`mt-4 text-2xl font-bold tracking-tight tabular-nums sm:text-3xl ${
               remainingCents < 0
@@ -390,7 +520,6 @@ function BudgetPlannerForm() {
           >
             {incomeSettings ? currency(remainingCents) : "—"}
           </p>
-
           <p className="mt-1 text-xs text-[var(--muted)]">
             {remainingCents < 0
               ? "Your plan exceeds your income"
@@ -399,7 +528,6 @@ function BudgetPlannerForm() {
         </div>
       </section>
 
-      {/* Income allocation progress */}
       {incomeSettings && (
         <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--shadow-card)] sm:p-5">
           <div className="flex flex-wrap items-end justify-between gap-2">
@@ -411,7 +539,6 @@ function BudgetPlannerForm() {
                 How much of your reliable income has a job?
               </p>
             </div>
-
             <p
               className={`text-lg font-bold tabular-nums ${
                 allocationIsOver
@@ -478,7 +605,6 @@ function BudgetPlannerForm() {
         </section>
       )}
 
-      {/* Budget categories */}
       <form onSubmit={handleSubmit} className="space-y-5 sm:space-y-6">
         <div className="flex flex-wrap items-end justify-between gap-2">
           <div>
@@ -489,7 +615,6 @@ function BudgetPlannerForm() {
               Set a planned amount for each category.
             </p>
           </div>
-
           <p className="text-xs text-[var(--muted-light)]">
             Amounts in AUD
           </p>
@@ -528,7 +653,6 @@ function BudgetPlannerForm() {
                     {group.description}
                   </p>
                 </div>
-
                 <div className="text-right">
                   <p className="text-xs text-[var(--muted)]">
                     Group total
@@ -547,7 +671,6 @@ function BudgetPlannerForm() {
                 )}
 
                 {groupCategories.map((category) => {
-                  // Read the cents value from validCategories, not the draft.
                   const plannedAmountCents =
                     validCategories.find(
                       (item) => item.id === category.id,
@@ -587,7 +710,6 @@ function BudgetPlannerForm() {
                               {currency(plannedForPeriod)}
                             </span>
                           </span>
-
                           <span>
                             Spent{" "}
                             <span className="font-medium text-[var(--foreground)]">
@@ -623,7 +745,6 @@ function BudgetPlannerForm() {
                           >
                             $
                           </span>
-
                           <input
                             id={`amount-${category.id}`}
                             name={`amount-${category.id}`}
@@ -633,7 +754,10 @@ function BudgetPlannerForm() {
                             inputMode="decimal"
                             value={category.plannedAmount}
                             onChange={(event) =>
-                              updateAmount(category.id, event.target.value)
+                              updateAmount(
+                                category.id,
+                                event.target.value,
+                              )
                             }
                             aria-invalid={
                               category.plannedAmount.trim() !== "" &&
@@ -670,9 +794,8 @@ function BudgetPlannerForm() {
           );
         })}
 
-        {/* Save actions */}
         <div className="flex flex-col gap-3 border-t border-[var(--border)] pt-5 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
+          <div className="min-w-0 space-y-2">
             {saved && (
               <p
                 role="status"
@@ -684,13 +807,18 @@ function BudgetPlannerForm() {
                 >
                   ✓
                 </span>
-                Budget saved in this browser.
+                Budget saved to the database.
               </p>
             )}
 
             {saveError && (
-              <p role="alert" className="text-sm font-medium text-[var(--danger)]">
-                Could not save your budget. Check your browser storage settings.
+              <p
+                role="alert"
+                className="text-sm font-medium text-[var(--danger)]"
+              >
+                Could not save your budget to the database. Your changes have
+                been preserved in this browser where possible. Check the
+                terminal for details.
               </p>
             )}
 
@@ -709,15 +837,10 @@ function BudgetPlannerForm() {
 
           <button
             type="submit"
-            disabled={!inputsValid}
+            disabled={!inputsValid || isSaving || isLoading}
             className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--primary)] px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-[var(--primary-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              className="size-4"
-              aria-hidden="true"
-            >
+            <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
               <path
                 d="M5 4h12l3 3v13H4V4h1Zm3 0v6h8V4M8 20v-7h8v7"
                 stroke="currentColor"
@@ -726,7 +849,7 @@ function BudgetPlannerForm() {
                 strokeLinejoin="round"
               />
             </svg>
-            Save budget
+            {isSaving ? "Saving..." : "Save budget"}
           </button>
         </div>
       </form>

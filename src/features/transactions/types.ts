@@ -11,3 +11,11 @@ export type Transaction = {
 };
 
 export type TransactionDraft = Omit<Transaction, "id">;
+
+/**
+ * Database-compatible transaction shape.
+ * A transaction can exist without a category.
+ */
+export type DatabaseTransaction = Omit<Transaction, "categoryId"> & {
+  categoryId: string | null;
+};

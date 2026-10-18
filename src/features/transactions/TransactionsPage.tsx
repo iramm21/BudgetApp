@@ -1,8 +1,18 @@
 
 "use client";
 
-import { useState, useSyncExternalStore, type FormEvent } from "react";
-import { DEFAULT_CATEGORIES, loadBudgetPlan } from "@/features/budget/storage";
+import { useEffect, useState, useSyncExternalStore, type FormEvent } from "react";
+import { DEFAULT_CATEGORIES } from "@/features/budget/storage";
+import {
+  getBudgetPlan,
+  initializeBudgetPlan,
+} from "@/features/budget/actions";
+import {
+  createTransaction,
+  deleteTransaction,
+  getTransactions,
+  importTransactions,
+} from "./actions";
 import { loadTransactions, saveTransactions } from "./storage";
 import type { Transaction, TransactionType } from "./types";
 import {
@@ -42,22 +52,121 @@ function formatDate(date: string): string {
 }
 
 function TransactionsForm() {
-  const [transactions, setTransactions] = useState<Transaction[]>(() =>
-    loadTransactions(),
-  );
-
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [date, setDate] = useState(todayLocal);
-  const [categoryId, setCategoryId] = useState(DEFAULT_CATEGORIES[0].id);
+  const [categoryId, setCategoryId] = useState("");
   const [type, setType] = useState<TransactionType>("expense");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState<string | null>(null);
 
-  const budgetPlan = loadBudgetPlan();
-  const categories = budgetPlan.categories.length
-    ? budgetPlan.categories
-    : DEFAULT_CATEGORIES;
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDatabaseData() {
+      try {
+        // Load the actual database categories.
+        let budget = await getBudgetPlan();
+
+        // Create the default categories if none exist yet.
+        if (!budget) {
+          budget = await initializeBudgetPlan(DEFAULT_CATEGORIES);
+        }
+
+        if (cancelled) return;
+
+        setCategories(budget.categories);
+
+        setCategoryId((current) =>
+          budget.categories.some((category) => category.id === current)
+            ? current
+            : budget.categories[0]?.id ?? "",
+        );
+
+        let databaseTransactions = await getTransactions();
+
+        // Import browser transactions only when the database is empty.
+        if (databaseTransactions.length === 0) {
+          const localTransactions = loadTransactions();
+
+          if (localTransactions.length > 0) {
+            const defaultCategoryById = new Map(
+              DEFAULT_CATEGORIES.map((category) => [
+                category.id,
+                category.name.trim().toLowerCase(),
+              ]),
+            );
+
+            const databaseCategoryByName = new Map(
+              budget.categories.map((category) => [
+                category.name.trim().toLowerCase(),
+                category.id,
+              ]),
+            );
+
+            const transactionsToImport = localTransactions.map(
+              (transaction) => {
+                if (transaction.type === "income") {
+                  return {
+                    ...transaction,
+                    categoryId: "",
+                  };
+                }
+
+                const categoryName = defaultCategoryById.get(
+                  transaction.categoryId,
+                );
+
+                return {
+                  ...transaction,
+                  categoryId: categoryName
+                    ? databaseCategoryByName.get(categoryName) ?? ""
+                    : "",
+                };
+              },
+            );
+
+            await importTransactions(transactionsToImport);
+            databaseTransactions = await getTransactions();
+          }
+        }
+
+        if (cancelled) return;
+
+        const normalisedTransactions: Transaction[] =
+          databaseTransactions.map((transaction) => ({
+            ...transaction,
+            categoryId: transaction.categoryId ?? "",
+          }));
+
+        setTransactions(normalisedTransactions);
+        saveTransactions(normalisedTransactions);
+      } catch (err) {
+        if (cancelled) return;
+
+        // Preserve access to browser data if the database is unavailable.
+        setTransactions(loadTransactions());
+        setError(
+          err instanceof Error
+            ? `Could not load transactions from the database: ${err.message} Browser data is shown instead; changes may not be synchronised.`
+            : "Could not load transactions from the database. Browser data is shown instead; changes may not be synchronised.",
+        );
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    void loadDatabaseData();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const totalExpenses = calculateTotalExpensesCents(transactions);
   const totalIncome = calculateTotalIncomeCents(transactions);
@@ -68,7 +177,7 @@ function TransactionsForm() {
     setError("");
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     clearFeedback();
 
@@ -102,44 +211,68 @@ function TransactionsForm() {
       return;
     }
 
-    const transaction: Transaction = {
-      id: crypto.randomUUID(),
-      description: description.trim(),
-      amountCents,
-      date,
-      categoryId: type === "expense" ? categoryId : "income",
-      type,
-    };
+    setIsSaving(true);
 
-    const updatedTransactions = [transaction, ...transactions];
+    try {
+      const saved = await createTransaction({
+        description: description.trim(),
+        amountCents,
+        date,
+        categoryId: type === "expense" ? categoryId : "",
+        type,
+      });
 
-    if (!saveTransactions(updatedTransactions)) {
-      setError("Could not save. Check your browser storage settings.");
-      return;
+      const transaction: Transaction = {
+        ...saved,
+        categoryId: saved.categoryId ?? "",
+      };
+
+      const updatedTransactions = [
+        transaction,
+        ...transactions,
+      ].sort((a, b) => b.date.localeCompare(a.date));
+
+      setTransactions(updatedTransactions);
+      saveTransactions(updatedTransactions);
+
+      setDescription("");
+      setAmount("");
+      setDate(todayLocal());
+      setMessage("Transaction saved to the database.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not save the transaction. Please try again.",
+      );
+    } finally {
+      setIsSaving(false);
     }
-
-    setTransactions(updatedTransactions);
-    setDescription("");
-    setAmount("");
-    setDate(todayLocal());
-    setError("");
-    setMessage("Transaction saved.");
   }
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     clearFeedback();
+    setIsDeleting(id);
 
-    const updatedTransactions = transactions.filter(
-      (transaction) => transaction.id !== id,
-    );
+    try {
+      await deleteTransaction(id);
 
-    if (!saveTransactions(updatedTransactions)) {
-      setError("Could not delete the transaction. Please try again.");
-      return;
+      const updatedTransactions = transactions.filter(
+        (transaction) => transaction.id !== id,
+      );
+
+      setTransactions(updatedTransactions);
+      saveTransactions(updatedTransactions);
+      setMessage("Transaction deleted from the database.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not delete the transaction. Please try again.",
+      );
+    } finally {
+      setIsDeleting(null);
     }
-
-    setTransactions(updatedTransactions);
-    setMessage("Transaction deleted.");
   }
 
   return (
@@ -178,12 +311,7 @@ function TransactionsForm() {
             </div>
 
             <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-[var(--danger-background)] text-[var(--danger)]">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-5"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
                 <path
                   d="M12 5v14m-6-6 6 6 6-6"
                   stroke="currentColor"
@@ -211,12 +339,7 @@ function TransactionsForm() {
             </div>
 
             <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-[var(--success-background)] text-[var(--success)]">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-5"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
                 <path
                   d="M12 19V5m-6 6 6-6 6 6"
                   stroke="currentColor"
@@ -251,12 +374,7 @@ function TransactionsForm() {
             </div>
 
             <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-[var(--surface-secondary)] text-[var(--primary)]">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-5"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
                 <rect
                   x="3.5"
                   y="5.5"
@@ -344,7 +462,7 @@ function TransactionsForm() {
                 id="description"
                 name="description"
                 required
-                maxLength={100}
+                maxLength={200}
                 value={description}
                 onChange={(event) => {
                   setDescription(event.target.value);
@@ -403,6 +521,7 @@ function TransactionsForm() {
               <select
                 id="category"
                 name="category"
+                required
                 value={categoryId}
                 onChange={(event) => {
                   setCategoryId(event.target.value);
@@ -425,14 +544,10 @@ function TransactionsForm() {
           <div className="space-y-3 border-t border-[var(--border)] pt-5">
             <button
               type="submit"
-              className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-md)] bg-[var(--primary)] px-5 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[var(--primary-hover)] sm:w-auto"
+              disabled={isSaving || isLoading}
+              className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-md)] bg-[var(--primary)] px-5 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[var(--primary-hover)] disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
             >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-4"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
                 <path
                   d="M12 5v14m-7-7h14"
                   stroke="currentColor"
@@ -440,7 +555,7 @@ function TransactionsForm() {
                   strokeLinecap="round"
                 />
               </svg>
-              Add transaction
+              {isSaving ? "Saving..." : "Add transaction"}
             </button>
 
             {message && (
@@ -448,12 +563,7 @@ function TransactionsForm() {
                 role="status"
                 className="flex items-start gap-2 rounded-[var(--radius-md)] border border-[var(--success)]/20 bg-[var(--success-background)] p-3 text-sm font-medium text-[var(--success)]"
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  className="mt-0.5 size-4 shrink-0"
-                  aria-hidden="true"
-                >
+                <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 size-4 shrink-0" aria-hidden="true">
                   <path
                     d="m5 12 4 4L19 6"
                     stroke="currentColor"
@@ -471,17 +581,13 @@ function TransactionsForm() {
                 role="alert"
                 className="flex items-start gap-2 rounded-[var(--radius-md)] border border-[var(--danger)]/20 bg-[var(--danger-background)] p-3 text-sm font-medium text-[var(--danger)]"
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  className="mt-0.5 size-4 shrink-0"
-                  aria-hidden="true"
-                >
+                <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 size-4 shrink-0" aria-hidden="true">
                   <path
                     d="M12 8v4m0 4h.01M10.3 3.9 2.8 17a2 2 0 0 0 1.7 0l7.5-13.1a2 2 0 0 0-3.4 0Z"
                     stroke="currentColor"
                     strokeWidth="1.8"
                     strokeLinecap="round"
+                    strokeLinejoin="round"
                   />
                 </svg>
                 {error}
@@ -507,15 +613,14 @@ function TransactionsForm() {
           </div>
         </div>
 
-        {transactions.length === 0 ? (
+        {isLoading ? (
+          <div className="px-6 py-12 text-center text-sm text-[var(--muted)]">
+            Loading transactions...
+          </div>
+        ) : transactions.length === 0 ? (
           <div className="px-6 py-12 text-center">
             <div className="mx-auto flex size-12 items-center justify-center rounded-2xl bg-[var(--surface-secondary)] text-[var(--muted)]">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-6"
-                aria-hidden="true"
-              >
+              <svg viewBox="0 0 24 24" fill="none" className="size-6" aria-hidden="true">
                 <path
                   d="M7 3.75h7l4.25 4.5v11A1.75 1.75 0 0 1 16.5 21h-9A1.75 1.75 0 0 1 5.75 19.25V5.5A1.75 1.75 0 0 1 7.5 3.75Z"
                   stroke="currentColor"
@@ -559,12 +664,7 @@ function TransactionsForm() {
                           : "bg-[var(--danger-background)] text-[var(--danger)]"
                       }`}
                     >
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        className="size-5"
-                        aria-hidden="true"
-                      >
+                      <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
                         {isIncome ? (
                           <path
                             d="M12 19V5m-6 6 6-6 6 6"
@@ -592,7 +692,9 @@ function TransactionsForm() {
                       <p className="mt-1 text-xs text-[var(--muted)]">
                         {formatDate(transaction.date)}
                         <span aria-hidden="true"> · </span>
-                        {isIncome ? "Income" : category?.name ?? "Uncategorised"}
+                        {isIncome
+                          ? "Income"
+                          : category?.name ?? "Uncategorised"}
                       </p>
                     </div>
                   </div>
@@ -611,11 +713,12 @@ function TransactionsForm() {
 
                     <button
                       type="button"
-                      onClick={() => handleDelete(transaction.id)}
+                      onClick={() => void handleDelete(transaction.id)}
+                      disabled={isDeleting !== null || isLoading}
                       aria-label={`Delete ${transaction.description}`}
-                      className="inline-flex min-h-9 items-center justify-center rounded-lg border border-transparent px-3 py-2 text-xs font-semibold text-[var(--danger)] transition-colors hover:border-[var(--danger)]/20 hover:bg-[var(--danger-background)] focus-visible:outline-none"
+                      className="inline-flex min-h-9 items-center justify-center rounded-lg border border-transparent px-3 py-2 text-xs font-semibold text-[var(--danger)] transition-colors hover:border-[var(--danger)]/20 hover:bg-[var(--danger-background)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      Delete
+                      {isDeleting === transaction.id ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                 </li>

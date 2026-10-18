@@ -1,20 +1,17 @@
 
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import Link from "next/link";
 
-import { loadIncomeSettings } from "@/features/income/storage";
-import { loadBudgetPlan } from "@/features/budget/storage";
-import { loadTransactions } from "@/features/transactions/storage";
-import {
-  calculateTotalExpensesCents,
-  calculateTotalIncomeCents,
-} from "@/features/transactions/calculations";
-
-const subscribe = () => () => {};
-const getSnapshot = () => true;
-const getServerSnapshot = () => false;
+import { getIncomeSettings } from "@/features/income/actions";
+import { getBudgetPlan } from "@/features/budget/actions";
+import { getTransactions } from "@/features/transactions/actions";
 
 const currency = (cents: number) =>
   new Intl.NumberFormat("en-AU", {
@@ -34,11 +31,24 @@ function formatDate(dateString: string) {
   }).format(date);
 }
 
-const groupDetails: {
-  id: "essentials" | "lifestyle" | "financial";
-  title: string;
-  description: string;
-}[] = [
+function subscribeToGreeting() {
+  return () => {};
+}
+
+function getGreeting() {
+  const hour = new Date().getHours();
+
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+
+  return "Good evening";
+}
+
+function getServerGreeting() {
+  return "Hello";
+}
+
+const groupDetails = [
   {
     id: "essentials",
     title: "Essentials",
@@ -54,28 +64,129 @@ const groupDetails: {
     title: "Financial goals & other",
     description: "Savings, debt and other expenses.",
   },
-];
+] as const;
+
+type DashboardIncome = Awaited<ReturnType<typeof getIncomeSettings>>;
+type DashboardBudget = Awaited<ReturnType<typeof getBudgetPlan>>;
+type DashboardTransactions = Awaited<ReturnType<typeof getTransactions>>;
 
 function DashboardContent() {
-  const [incomeSettings] = useState(() => loadIncomeSettings());
-  const [budgetPlan] = useState(() => loadBudgetPlan());
-  const [transactions] = useState(() => loadTransactions());
+  const [incomeSettings, setIncomeSettings] =
+    useState<DashboardIncome>(null);
+  const [budgetPlan, setBudgetPlan] =
+    useState<DashboardBudget>(null);
+  const [transactions, setTransactions] =
+    useState<DashboardTransactions>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const greeting = useSyncExternalStore(
+    subscribeToGreeting,
+    getGreeting,
+    getServerGreeting,
+  );
+
+  const fetchDashboardData = useCallback(async () => {
+    const [income, budget, transactionRecords] = await Promise.all([
+      getIncomeSettings(),
+      getBudgetPlan(),
+      getTransactions(),
+    ]);
+
+    return {
+      income,
+      budget,
+      transactionRecords,
+    };
+  }, []);
+
+  const loadDashboard = useCallback(async () => {
+    setIsLoading(true);
+    setLoadError(null);
+
+    try {
+      const {
+        income,
+        budget,
+        transactionRecords,
+      } = await fetchDashboardData();
+
+      setIncomeSettings(income);
+      setBudgetPlan(budget);
+      setTransactions(transactionRecords);
+    } catch (error) {
+      console.error("Failed to load dashboard data:", error);
+
+      setLoadError(
+        "We couldn't load your financial data. Check your connection and try again.",
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  }, [fetchDashboardData]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initialiseDashboard() {
+      try {
+        const {
+          income,
+          budget,
+          transactionRecords,
+        } = await fetchDashboardData();
+
+        if (cancelled) return;
+
+        setIncomeSettings(income);
+        setBudgetPlan(budget);
+        setTransactions(transactionRecords);
+      } catch (error) {
+        if (cancelled) return;
+
+        console.error("Failed to load dashboard data:", error);
+
+        setLoadError(
+          "We couldn't load your financial data. Check your connection and try again.",
+        );
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void initialiseDashboard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchDashboardData]);
+
+  const categories = budgetPlan?.categories ?? [];
 
   const baseIncomeCents = incomeSettings?.baseNetPayCents ?? 0;
 
-  const payPeriodDays =
-    incomeSettings?.payFrequency === "weekly" ? 7 : 14;
-
-  // Convert reliable income to an approximate monthly figure.
   const payPeriodIncomeCents = baseIncomeCents;
 
-  const totalPlannedCents = budgetPlan.categories.reduce(
+  const totalPlannedCents = categories.reduce(
     (total, category) => total + category.plannedAmountCents,
     0,
   );
 
-  const totalSpentCents = calculateTotalExpensesCents(transactions);
-  const transactionIncomeCents = calculateTotalIncomeCents(transactions);
+  const totalSpentCents = transactions.reduce(
+    (total, transaction) =>
+      total +
+      (transaction.type === "expense" ? transaction.amountCents : 0),
+    0,
+  );
+
+  const transactionIncomeCents = transactions.reduce(
+    (total, transaction) =>
+      total +
+      (transaction.type === "income" ? transaction.amountCents : 0),
+    0,
+  );
 
   const budgetRemainingCents =
     payPeriodIncomeCents - totalPlannedCents;
@@ -95,15 +206,59 @@ function DashboardContent() {
     })
     .slice(0, 5);
 
-  const now = new Date();
-  const greeting =
-    now.getHours() < 12
-      ? "Good morning"
-      : now.getHours() < 18
-        ? "Good afternoon"
-        : "Good evening";
-
   const allocationIsOver = allocationPercentage > 100;
+
+  if (isLoading) {
+    return (
+      <div className="mx-auto w-full max-w-7xl space-y-6">
+        <div className="space-y-3">
+          <div className="h-3 w-28 animate-pulse rounded bg-[var(--border)]" />
+          <div className="h-9 w-64 max-w-full animate-pulse rounded bg-[var(--border)]" />
+          <div className="h-4 w-80 max-w-full animate-pulse rounded bg-[var(--border)]" />
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {[1, 2, 3, 4].map((item) => (
+            <div
+              key={item}
+              className="h-32 animate-pulse rounded-xl border border-[var(--border)] bg-[var(--surface)]"
+            />
+          ))}
+        </div>
+
+        <p className="text-sm text-[var(--muted)]">
+          Loading your dashboard...
+        </p>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="mx-auto w-full max-w-7xl">
+        <section
+          className="rounded-xl border border-[var(--danger)]/25 bg-[var(--danger-background)] p-5 sm:p-6"
+          role="alert"
+        >
+          <h1 className="text-xl font-bold text-[var(--foreground)]">
+            Unable to load your dashboard
+          </h1>
+
+          <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+            {loadError}
+          </p>
+
+          <button
+            type="button"
+            onClick={() => void loadDashboard()}
+            className="mt-4 inline-flex min-h-10 items-center justify-center rounded-lg bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[var(--primary-hover)]"
+          >
+            Try again
+          </button>
+        </section>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto w-full max-w-7xl space-y-7 sm:space-y-8">
@@ -523,7 +678,7 @@ function DashboardContent() {
 
             <div className="mt-5 space-y-5">
               {groupDetails.map((group, index) => {
-                const groupTotal = budgetPlan.categories
+                const groupTotal = categories
                   .filter((category) => category.group === group.id)
                   .reduce(
                     (total, category) =>
@@ -750,36 +905,5 @@ function StatCard({
 }
 
 export default function Dashboard() {
-  const isMounted = useSyncExternalStore(
-    subscribe,
-    getSnapshot,
-    getServerSnapshot,
-  );
-
-  if (!isMounted) {
-    return (
-      <div className="mx-auto w-full max-w-7xl space-y-6">
-        <div className="space-y-3">
-          <div className="h-3 w-28 animate-pulse rounded bg-[var(--border)]" />
-          <div className="h-9 w-64 max-w-full animate-pulse rounded bg-[var(--border)]" />
-          <div className="h-4 w-80 max-w-full animate-pulse rounded bg-[var(--border)]" />
-        </div>
-
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          {[1, 2, 3, 4].map((item) => (
-            <div
-              key={item}
-              className="h-32 animate-pulse rounded-xl border border-[var(--border)] bg-[var(--surface)]"
-            />
-          ))}
-        </div>
-
-        <p className="text-sm text-[var(--muted)]">
-          Loading your dashboard...
-        </p>
-      </div>
-    );
-  }
-
   return <DashboardContent />;
 }

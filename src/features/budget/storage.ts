@@ -21,13 +21,17 @@ export const DEFAULT_CATEGORIES: BudgetCategory[] = [
 ];
 
 function isBudgetCategory(value: unknown): value is BudgetCategory {
-  if (typeof value !== "object" || value === null) return false;
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
 
   const category = value as Record<string, unknown>;
 
   return (
     typeof category.id === "string" &&
+    category.id.trim().length > 0 &&
     typeof category.name === "string" &&
+    category.name.trim().length > 0 &&
     (category.group === "essentials" ||
       category.group === "lifestyle" ||
       category.group === "financial") &&
@@ -37,33 +41,62 @@ function isBudgetCategory(value: unknown): value is BudgetCategory {
   );
 }
 
+function isBudgetPlan(value: unknown): value is BudgetPlan {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const plan = value as Record<string, unknown>;
+
+  if (
+    !Array.isArray(plan.categories) ||
+    !plan.categories.every(isBudgetCategory)
+  ) {
+    return false;
+  }
+
+  const ids = plan.categories.map((category: BudgetCategory) => category.id);
+
+  return new Set(ids).size === ids.length;
+}
+
+/**
+ * Loads the saved budget plan from this browser.
+ * Returns the default categories if storage is missing or invalid.
+ */
 export function loadBudgetPlan(): BudgetPlan {
   try {
     const storedValue = localStorage.getItem(STORAGE_KEY);
 
     if (storedValue === null) {
-      return { categories: DEFAULT_CATEGORIES };
+      return { categories: DEFAULT_CATEGORIES.map((category) => ({ ...category })) };
     }
 
     const parsed: unknown = JSON.parse(storedValue);
 
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "categories" in parsed &&
-      Array.isArray(parsed.categories) &&
-      parsed.categories.every(isBudgetCategory)
-    ) {
-      return { categories: parsed.categories };
+    if (isBudgetPlan(parsed)) {
+      return {
+        categories: parsed.categories.map((category) => ({ ...category })),
+      };
     }
   } catch {
-    // Fall back to the default plan if storage is unavailable or invalid.
+    // Fall back to defaults if storage is unavailable or invalid.
   }
 
-  return { categories: DEFAULT_CATEGORIES };
+  return {
+    categories: DEFAULT_CATEGORIES.map((category) => ({ ...category })),
+  };
 }
 
+/**
+ * Saves a valid budget plan to this browser.
+ * Returns false if validation or browser storage fails.
+ */
 export function saveBudgetPlan(plan: BudgetPlan): boolean {
+  if (!isBudgetPlan(plan)) {
+    return false;
+  }
+
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(plan));
     return true;

@@ -8,7 +8,12 @@ import {
   type SavingsCategory,
   type SavingsGoal,
 } from "./types";
-import { loadSavingsGoals, saveSavingsGoals } from "./storage";
+import {
+  getSavingsGoals,
+  createSavingsGoal,
+  addSavingsContribution,
+  deleteSavingsGoal,
+} from "./actions";
 
 const currency = new Intl.NumberFormat("en-AU", {
   style: "currency",
@@ -29,10 +34,17 @@ function formatPercent(value: number): string {
   return `${Math.round(value)}%`;
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Something went wrong. Please try again.";
+}
+
 export default function SavingsPage() {
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [pageError, setPageError] = useState("");
 
   const [goalName, setGoalName] = useState("");
   const [goalCategory, setGoalCategory] =
@@ -43,25 +55,36 @@ export default function SavingsPage() {
     useState<string | null>(null);
   const [contributionAmount, setContributionAmount] = useState("");
 
-  // Load existing goals after mounting. The timer avoids a synchronous
-  // state update directly inside the effect body.
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setGoals(loadSavingsGoals());
-      setIsLoaded(true);
-    }, 0);
+    let cancelled = false;
 
-    return () => window.clearTimeout(timer);
+    async function loadGoals() {
+      try {
+        const savedGoals = await getSavingsGoals();
+
+        if (!cancelled) {
+          setGoals(savedGoals);
+          setPageError("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setPageError(
+            `Could not load your savings goals. ${getErrorMessage(error)}`,
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoaded(true);
+        }
+      }
+    }
+
+    void loadGoals();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
-
-  // Update React state and persist the same goal list to browser storage.
-  // This is called from user actions, not from an effect.
-  function persistGoals(nextGoals: SavingsGoal[]) {
-    const savedSuccessfully = saveSavingsGoals(nextGoals);
-
-    setGoals(nextGoals);
-    setSaveError(!savedSuccessfully);
-  }
 
   const totals = useMemo(() => {
     const saved = goals.reduce(
@@ -94,31 +117,38 @@ export default function SavingsPage() {
     };
   }, [goals]);
 
-  function handleCreateGoal(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateGoal(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const name = goalName.trim();
     const targetAmountCents = dollarsToCents(goalTarget);
 
-    if (!name || targetAmountCents <= 0) return;
+    if (!name || targetAmountCents <= 0 || isSaving) return;
 
-    const newGoal: SavingsGoal = {
-      id: crypto.randomUUID(),
-      name,
-      category: goalCategory,
-      targetAmountCents,
-      savedAmountCents: 0,
-      createdAt: new Date().toISOString(),
-    };
+    setIsSaving(true);
+    setPageError("");
 
-    persistGoals([...goals, newGoal]);
+    try {
+      const createdGoal = await createSavingsGoal({
+        name,
+        category: goalCategory,
+        targetAmountCents,
+      });
 
-    setGoalName("");
-    setGoalCategory("Emergency Fund");
-    setGoalTarget("");
+      setGoals((currentGoals) => [...currentGoals, createdGoal]);
+      setGoalName("");
+      setGoalCategory("Emergency Fund");
+      setGoalTarget("");
+    } catch (error) {
+      setPageError(
+        `Could not create the savings goal. ${getErrorMessage(error)}`,
+      );
+    } finally {
+      setIsSaving(false);
+    }
   }
 
-  function handleContribution(
+  async function handleContribution(
     event: FormEvent<HTMLFormElement>,
     goalId: string,
   ) {
@@ -126,30 +156,38 @@ export default function SavingsPage() {
 
     const amountCents = dollarsToCents(contributionAmount);
 
-    if (amountCents <= 0) return;
+    if (amountCents <= 0 || isSaving) return;
 
-    const goalExists = goals.some((goal) => goal.id === goalId);
-    if (!goalExists) return;
+    setIsSaving(true);
+    setPageError("");
 
-    const nextGoals = goals.map((goal) =>
-      goal.id === goalId
-        ? {
-            ...goal,
-            savedAmountCents: goal.savedAmountCents + amountCents,
-          }
-        : goal,
-    );
+    try {
+      const updatedGoal = await addSavingsContribution(
+        goalId,
+        amountCents,
+      );
 
-    persistGoals(nextGoals);
+      setGoals((currentGoals) =>
+        currentGoals.map((goal) =>
+          goal.id === updatedGoal.id ? updatedGoal : goal,
+        ),
+      );
 
-    setContributionAmount("");
-    setActiveContributionId(null);
+      setContributionAmount("");
+      setActiveContributionId(null);
+    } catch (error) {
+      setPageError(
+        `Could not save the contribution. ${getErrorMessage(error)}`,
+      );
+    } finally {
+      setIsSaving(false);
+    }
   }
 
-  function handleDeleteGoal(goalId: string) {
+  async function handleDeleteGoal(goalId: string) {
     const goal = goals.find((item) => item.id === goalId);
 
-    if (!goal) return;
+    if (!goal || isSaving) return;
 
     const confirmed = window.confirm(
       `Delete "${goal.name}" from your savings tracker? This removes its recorded balance from this app.`,
@@ -157,11 +195,26 @@ export default function SavingsPage() {
 
     if (!confirmed) return;
 
-    persistGoals(goals.filter((item) => item.id !== goalId));
+    setIsSaving(true);
+    setPageError("");
 
-    if (activeContributionId === goalId) {
-      setActiveContributionId(null);
-      setContributionAmount("");
+    try {
+      await deleteSavingsGoal(goalId);
+
+      setGoals((currentGoals) =>
+        currentGoals.filter((item) => item.id !== goalId),
+      );
+
+      if (activeContributionId === goalId) {
+        setActiveContributionId(null);
+        setContributionAmount("");
+      }
+    } catch (error) {
+      setPageError(
+        `Could not delete the savings goal. ${getErrorMessage(error)}`,
+      );
+    } finally {
+      setIsSaving(false);
     }
   }
 
@@ -204,13 +257,12 @@ export default function SavingsPage() {
         </p>
       </header>
 
-      {saveError && (
+      {pageError && (
         <div
           role="alert"
           className="rounded-[var(--radius-md)] border border-[var(--danger)] bg-[var(--danger-background)] p-4 text-sm text-[var(--danger)]"
         >
-          Your latest changes could not be saved in this browser. Check your
-          browser storage settings before leaving this page.
+          {pageError}
         </div>
       )}
 
@@ -342,8 +394,9 @@ export default function SavingsPage() {
 
                       <button
                         type="button"
-                        onClick={() => handleDeleteGoal(goal.id)}
-                        className="self-start rounded-lg px-3 py-2 text-sm font-medium text-[var(--muted)] transition hover:bg-[var(--danger-background)] hover:text-[var(--danger)]"
+                        onClick={() => void handleDeleteGoal(goal.id)}
+                        disabled={isSaving}
+                        className="self-start rounded-lg px-3 py-2 text-sm font-medium text-[var(--muted)] transition hover:bg-[var(--danger-background)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label={`Delete ${goal.name}`}
                       >
                         Delete
@@ -394,7 +447,7 @@ export default function SavingsPage() {
                     {activeContributionId === goal.id ? (
                       <form
                         onSubmit={(event) =>
-                          handleContribution(event, goal.id)
+                          void handleContribution(event, goal.id)
                         }
                         className="mt-5 rounded-[var(--radius-md)] bg-[var(--surface-secondary)] p-4"
                       >
@@ -418,21 +471,24 @@ export default function SavingsPage() {
                               setContributionAmount(event.target.value)
                             }
                             placeholder="e.g. 100.00"
-                            className="min-w-0 flex-1 rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)]"
+                            disabled={isSaving}
+                            className="min-w-0 flex-1 rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)] disabled:opacity-60"
                           />
                           <button
                             type="submit"
-                            className="rounded-lg bg-[var(--primary)] px-4 py-2.5 font-semibold text-white transition hover:bg-[var(--primary-hover)]"
+                            disabled={isSaving}
+                            className="rounded-lg bg-[var(--primary)] px-4 py-2.5 font-semibold text-white transition hover:bg-[var(--primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            Save contribution
+                            {isSaving ? "Saving..." : "Save contribution"}
                           </button>
                           <button
                             type="button"
+                            disabled={isSaving}
                             onClick={() => {
                               setActiveContributionId(null);
                               setContributionAmount("");
                             }}
-                            className="rounded-lg border border-[var(--border)] px-4 py-2.5 font-semibold transition hover:bg-[var(--surface)]"
+                            className="rounded-lg border border-[var(--border)] px-4 py-2.5 font-semibold transition hover:bg-[var(--surface)] disabled:opacity-50"
                           >
                             Cancel
                           </button>
@@ -441,11 +497,12 @@ export default function SavingsPage() {
                     ) : (
                       <button
                         type="button"
+                        disabled={isSaving}
                         onClick={() => {
                           setActiveContributionId(goal.id);
                           setContributionAmount("");
                         }}
-                        className="mt-5 w-full rounded-lg bg-[var(--primary)] px-4 py-3 font-semibold text-white transition hover:bg-[var(--primary-hover)]"
+                        className="mt-5 w-full rounded-lg bg-[var(--primary)] px-4 py-3 font-semibold text-white transition hover:bg-[var(--primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         + Add contribution
                       </button>
@@ -463,7 +520,7 @@ export default function SavingsPage() {
             Set a target and start tracking your progress.
           </p>
 
-          <form onSubmit={handleCreateGoal} className="mt-5 space-y-4">
+          <form onSubmit={(event) => void handleCreateGoal(event)} className="mt-5 space-y-4">
             <div>
               <label
                 htmlFor="goal-name"
@@ -479,7 +536,8 @@ export default function SavingsPage() {
                 value={goalName}
                 onChange={(event) => setGoalName(event.target.value)}
                 placeholder="e.g. First home deposit"
-                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)]"
+                disabled={isSaving}
+                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)] disabled:opacity-60"
               />
             </div>
 
@@ -496,7 +554,8 @@ export default function SavingsPage() {
                 onChange={(event) =>
                   setGoalCategory(event.target.value as SavingsCategory)
                 }
-                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)]"
+                disabled={isSaving}
+                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)] disabled:opacity-60"
               >
                 {SAVINGS_CATEGORIES.map((category) => (
                   <option key={category} value={category}>
@@ -523,15 +582,17 @@ export default function SavingsPage() {
                 value={goalTarget}
                 onChange={(event) => setGoalTarget(event.target.value)}
                 placeholder="e.g. 20000.00"
-                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)]"
+                disabled={isSaving}
+                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-2.5 outline-none transition focus:border-[var(--primary)] disabled:opacity-60"
               />
             </div>
 
             <button
               type="submit"
-              className="w-full rounded-lg bg-[var(--primary)] px-4 py-3 font-semibold text-white transition hover:bg-[var(--primary-hover)]"
+              disabled={isSaving}
+              className="w-full rounded-lg bg-[var(--primary)] px-4 py-3 font-semibold text-white transition hover:bg-[var(--primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Create savings goal
+              {isSaving ? "Saving..." : "Create savings goal"}
             </button>
           </form>
 

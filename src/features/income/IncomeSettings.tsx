@@ -3,7 +3,14 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import type { IncomeSettings, PayFrequency } from "./types";
-import { loadIncomeSettings, saveIncomeSettings } from "./storage";
+import {
+  getIncomeSettings,
+  saveIncomeSettings as saveIncomeSettingsToDatabase,
+} from "./actions";
+import {
+  loadIncomeSettings,
+  saveIncomeSettings as saveIncomeSettingsToStorage,
+} from "./storage";
 
 export default function IncomeSettingsForm() {
   const [payFrequency, setPayFrequency] =
@@ -12,16 +19,72 @@ export default function IncomeSettingsForm() {
   const [basePay, setBasePay] = useState("2356.58");
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    const settings = loadIncomeSettings();
+    let cancelled = false;
 
-    if (settings) {
-      // Load persisted settings once when the component mounts.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setPayFrequency(settings.payFrequency);
-      setBasePay((settings.baseNetPayCents / 100).toFixed(2));
+    async function loadSettings() {
+      const localSettings = loadIncomeSettings();
+
+      try {
+        const databaseSettings = await getIncomeSettings();
+
+        if (cancelled) return;
+
+        if (databaseSettings) {
+          setPayFrequency(databaseSettings.payFrequency);
+          setBasePay(
+            (databaseSettings.baseNetPayCents / 100).toFixed(2),
+          );
+
+          // Keep the browser copy synchronised with the database.
+          saveIncomeSettingsToStorage(databaseSettings);
+          return;
+        }
+
+        // Import existing browser settings if the database is empty.
+        if (localSettings) {
+          await saveIncomeSettingsToDatabase(localSettings);
+
+          if (cancelled) return;
+
+          setPayFrequency(localSettings.payFrequency);
+          setBasePay(
+            (localSettings.baseNetPayCents / 100).toFixed(2),
+          );
+          return;
+        }
+
+        // Neither source has settings; retain the initial defaults.
+      } catch (error) {
+        console.error("Failed to load income settings:", error);
+
+        if (cancelled) return;
+
+        // Keep the existing browser settings available if the
+        // database cannot be reached.
+        if (localSettings) {
+          setPayFrequency(localSettings.payFrequency);
+          setBasePay(
+            (localSettings.baseNetPayCents / 100).toFixed(2),
+          );
+        }
+
+        setSaveError(true);
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
     }
+
+    void loadSettings();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const amount = Number(basePay);
@@ -37,20 +100,34 @@ export default function IncomeSettingsForm() {
     currency: "AUD",
   }).format(isValid ? amount : 0);
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!isValid) return;
+    if (!isValid || isLoading || isSaving) return;
 
     const settings: IncomeSettings = {
       payFrequency,
       baseNetPayCents: Math.round(amount * 100),
     };
 
-    const success = saveIncomeSettings(settings);
+    setSaved(false);
+    setSaveError(false);
+    setIsSaving(true);
 
-    setSaved(success);
-    setSaveError(!success);
+    try {
+      await saveIncomeSettingsToDatabase(settings);
+
+      // The database is the primary source of truth.
+      // Keep a browser copy as a fallback during development.
+      saveIncomeSettingsToStorage(settings);
+
+      setSaved(true);
+    } catch (error) {
+      console.error("Failed to save income settings:", error);
+      setSaveError(true);
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   function handlePayChange(value: string) {
@@ -106,12 +183,13 @@ export default function IncomeSettingsForm() {
                 id="payFrequency"
                 name="payFrequency"
                 value={payFrequency}
+                disabled={isLoading || isSaving}
                 onChange={(event) =>
                   handleFrequencyChange(
                     event.target.value as PayFrequency,
                   )
                 }
-                className="min-h-12 w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--surface)] px-3.5 py-3 text-sm transition-colors hover:border-[var(--muted-light)] focus-visible:outline-none"
+                className="min-h-12 w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--surface)] px-3.5 py-3 text-sm transition-colors hover:border-[var(--muted-light)] focus-visible:outline-none disabled:cursor-wait disabled:opacity-60"
               >
                 <option value="weekly">Weekly</option>
                 <option value="fortnightly">Fortnightly</option>
@@ -146,11 +224,12 @@ export default function IncomeSettingsForm() {
                   inputMode="decimal"
                   required
                   value={basePay}
+                  disabled={isLoading || isSaving}
                   onChange={(event) =>
                     handlePayChange(event.target.value)
                   }
                   aria-describedby="basePay-help"
-                  className="min-h-14 w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--surface)] py-3 pl-9 pr-4 text-lg font-semibold tabular-nums transition-colors hover:border-[var(--muted-light)] focus-visible:outline-none"
+                  className="min-h-14 w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--surface)] py-3 pl-9 pr-4 text-lg font-semibold tabular-nums transition-colors hover:border-[var(--muted-light)] focus-visible:outline-none disabled:cursor-wait disabled:opacity-60"
                   placeholder="0.00"
                 />
               </div>
@@ -235,24 +314,32 @@ export default function IncomeSettingsForm() {
         <div className="space-y-3">
           <button
             type="submit"
-            disabled={!isValid}
+            disabled={!isValid || isLoading || isSaving}
             className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-md)] bg-[var(--primary)] px-5 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[var(--primary-hover)] disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              className="size-4"
-              aria-hidden="true"
-            >
-              <path
-                d="m5 12 4 4L19 6"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            Save income settings
+            {isSaving ? (
+              "Saving..."
+            ) : isLoading ? (
+              "Loading..."
+            ) : (
+              <>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  className="size-4"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="m5 12 4 4L19 6"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                Save income settings
+              </>
+            )}
           </button>
 
           {saved && (
@@ -274,7 +361,7 @@ export default function IncomeSettingsForm() {
                   strokeLinejoin="round"
                 />
               </svg>
-              Income settings saved in this browser.
+              Income settings saved to the database.
             </p>
           )}
 
@@ -297,8 +384,8 @@ export default function IncomeSettingsForm() {
                   strokeLinejoin="round"
                 />
               </svg>
-              Could not save settings. Check your browser storage
-              settings and try again.
+              Could not load or save settings in the database. Check the
+              terminal for details. Existing browser settings are preserved.
             </p>
           )}
         </div>
